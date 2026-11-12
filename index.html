@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>六度分隔 · 历史人物关系查询</title>
+  <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; background: #f5f3ef; color: #2c2c2c; display: flex; flex-direction: column; height: 100vh; }
+    header { padding: 14px 18px 10px; background: #fffdf9; border-bottom: 1px solid #e0dcd3; }
+    header h1 { font-size: 18px; font-weight: 600; }
+    header p { font-size: 12px; color: #8a857c; margin-top: 4px; }
+    .controls { display: flex; gap: 8px; padding: 12px 18px; background: #fffdf9; border-bottom: 1px solid #e0dcd3; flex-wrap: wrap; align-items: center; }
+    .controls input { flex: 1 1 140px; padding: 9px 12px; border: 1px solid #d6d0c5; border-radius: 8px; font-size: 14px; background: #fff; outline: none; }
+    .controls button { padding: 9px 18px; border: none; border-radius: 8px; background: #3d5a80; color: #fff; font-size: 14px; cursor: pointer; white-space: nowrap; }
+    .controls button:disabled { background: #b0b8c4; cursor: not-allowed; }
+    .controls label { font-size: 12px; color: #6b655c; display: flex; align-items: center; gap: 4px; }
+    .controls select { padding: 7px 8px; border-radius: 6px; border: 1px solid #d6d0c5; font-size: 13px; background: #fff; }
+    #status { padding: 8px 18px; font-size: 13px; color: #6b655c; background: #faf8f4; border-bottom: 1px solid #e8e3da; min-height: 36px; }
+    #status.error { color: #b23b3b; background: #fdf0f0; }
+    #network { flex: 1; width: 100%; min-height: 300px; background: #fdfcf9; }
+    .hint { font-size: 11px; color: #a09a90; padding: 4px 18px 10px; background: #fffdf9; }
+  </style>
+</head>
+<body>
+<header><h1>六度分隔 · 历史人物关系查询</h1><p>输入两位中国历史人物，查找 CBDB 中的最短关系链</p></header>
+<div class="controls">
+  <input id="personA" placeholder="人物 A，如：苏轼" value="苏轼">
+  <input id="personB" placeholder="人物 B，如：王安石" value="王安石">
+  <label>最大深度<select id="maxDepth"><option value="1">1 层</option><option value="2" selected>2 层</option><option value="3">3 层</option></select></label>
+  <button id="searchBtn">查找关系路径</button>
+</div>
+<div id="status">准备就绪。</div>
+<div id="network"></div>
+<div class="hint">拖动画布平移，滚轮缩放，点按节点高亮相邻关系。</div>
+<script>
+// 注意：这里改成了 EdgeOne 的默认函数路径 /cbdb
+const CBDB_BASE = 'https://cbdb.fas.harvard.edu/cbdbapi/person';
+function buildUrl(params) {
+  const url = new URL(CBDB_BASE);
+  Object.keys(params).forEach(k => url.searchParams.set(k, params[k]));
+  return '/cbdb?url=' + encodeURIComponent(url.toString());
+}
+function extractPersonInfo(data) {
+  const person = data?.Package?.PersonAuthority?.PersonInfo?.Person;
+  if (!person) return null;
+  const basic = person.BasicInfo || {};
+  const id = basic.PersonId;
+  const name = basic.ChName || basic.EngName || `ID:${id}`;
+  if (!id) return null;
+  const neighbors = [];
+  (person.PersonSocialAssociation?.Association || []).forEach(a => {
+    const nid = a.AssociationId || a.PersonId; if (!nid || nid === id) return;
+    neighbors.push({ id: String(nid), name: a.AssociationName || a.Name || `ID:${nid}`, relation: a.AssociationType || '社会关系' });
+  });
+  (person.PersonKinshipInfo?.Kinship || []).forEach(k => {
+    const nid = k.KinId || k.PersonId; if (!nid || nid === id) return;
+    neighbors.push({ id: String(nid), name: k.KinName || k.Name || `ID:${nid}`, relation: k.KinRelDesc || '亲属' });
+  });
+  return { id: String(id), name, neighbors };
+}
+const cache = new Map();
+async function fetchPersonByName(name) {
+  if (cache.has(name)) return cache.get(name);
+  const res = await fetch(buildUrl({ name, mode: 'json' }));
+  const data = await res.json();
+  const info = extractPersonInfo(data);
+  if (!info) throw new Error(`未找到“${name}”`);
+  cache.set(name, info); return info;
+}
+async function fetchPersonById(id) {
+  if (cache.has(id)) return cache.get(id);
+  const res = await fetch(buildUrl({ id, mode: 'json' }));
+  const info = extractPersonInfo(await res.json());
+  if (!info) throw new Error(`未找到 ID:${id}`);
+  cache.set(id, info); return info;
+}
+async function findShortestPath(aName, bName, maxDepth) {
+  const start = await fetchPersonByName(aName), end = await fetchPersonByName(bName);
+  if (start.id === end.id) return { path: [start], edges: [] };
+  let front = new Map([[start.id, { person: start, parentId: null, relation: null }]]);
+  let back = new Map([[end.id, { person: end, parentId: null, relation: null }]]);
+  const vF = new Set([start.id]), vB = new Set([end.id]);
+  for (let d = 0; d < maxDepth; d++) {
+    const expandF = front.size <= back.size;
+    const cur = expandF ? front : back, otherV = expandF ? vB : vF, next = new Map();
+    for (const [id, node] of cur) {
+      if (otherV.has(id)) return reconstruct(front, back, id);
+      let p; try { p = await fetchPersonById(id); } catch { continue; }
+      for (const nb of p.neighbors) {
+        if (!nb.id) continue;
+        if (otherV.has(nb.id)) {
+          next.set(nb.id, { person: { id: nb.id, name: nb.name }, parentId: id, relation: nb.relation });
+          return reconstruct(front, back, nb.id);
+        }
+        if (!vF.has(nb.id) && !vB.has(nb.id)) next.set(nb.id, { person: { id: nb.id, name: nb.name }, parentId: id, relation: nb.relation });
+      }
+    }
+    for (const [nid, rec] of next) { if (expandF && !vF.has(nid)) { front.set(nid, rec); vF.add(nid); } else if (!expandF && !vB.has(nid)) { back.set(nid, rec); vB.add(nid); } }
+  }
+  return null;
+}
+function reconstruct(front, back, meetId) {
+  const fp = []; let cur = meetId, g = 0;
+  while (cur && front.has(cur) && g++ < 50) { const n = front.get(cur); fp.unshift({ id: cur, name: n.person.name, relation: n.relation }); cur = n.parentId; }
+  const bp = []; cur = meetId; g = 0;
+  while (cur && back.has(cur) && g++ < 50) { const n = back.get(cur); if (cur !== meetId) bp.push({ id: cur, name: n.person.name, relation: n.relation }); cur = n.parentId; }
+  const full = [...fp, ...bp]; const edges = [];
+  for (let i = 0; i < full.length - 1; i++) edges.push({ from: full[i].id, to: full[i+1].id, label: full[i+1].relation || '关联' });
+  return { path: Array.from(new Map(full.map(n => [n.id, n])).values()), edges };
+}
+let network = null;
+function render(path, edges) {
+  const c = document.getElementById('network'); if (network) network.destroy();
+  if (!path?.length) { c.innerHTML = '<p style="padding:24px;color:#8a857c;">无路径。</p>'; return; }
+  const nd = new vis.DataSet(path.map((n, i) => ({ id: n.id, label: n.name, shape: 'box', color: { background: i === 0 ? '#3d5a80' : i === path.length - 1 ? '#b23b3b' : '#e8e3da', border: '#d6d0c5' }, font: { color: i === 0 || i === path.length - 1 ? '#fff' : '#2c2c2c' } })));
+  const ed = new vis.DataSet(edges.map(e => ({ from: e.from, to: e.to, label: e.label, arrows: 'to', font: { size: 11 }, color: { color: '#b0a89c' } })));
+  network = new vis.Network(c, { nodes: nd, edges: ed }, { physics: { stabilization: { iterations: 200 } }, interaction: { hover: true, dragNodes: true, dragView: true } });
+}
+document.getElementById('searchBtn').addEventListener('click', async () => {
+  const a = document.getElementById('personA').value.trim(), b = document.getElementById('personB').value.trim(), d = parseInt(document.getElementById('maxDepth').value);
+  const s = document.getElementById('status'); s.classList.remove('error');
+  if (!a || !b) { s.textContent = '请填写两个名字。'; s.classList.add('error'); return; }
+  s.textContent = '查询中…'; document.getElementById('searchBtn').disabled = true;
+  try {
+    const r = await findShortestPath(a, b, d);
+    if (!r) { s.textContent = `在 ${d} 层内未找到路径。`; s.classList.add('error'); render([], []); return; }
+    s.textContent = `路径：${r.path.map(n => n.name).join(' → ')}`;
+    render(r.path, r.edges);
+  } catch (e) { s.textContent = '查询失败：' + e.message; s.classList.add('error'); }
+  finally { document.getElementById('searchBtn').disabled = false; }
+});
+</script>
+</body>
+</html>
